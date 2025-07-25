@@ -98,11 +98,11 @@ class SimpleTracer:
         self.enabled = enabled
         self.events = []
     
-    def event(self, name: str, timestamp: float, phase: str = "i", **args):
+    def event(self, name: str, timestamp: float, phase: str = "i", gpu_id: int = 0, **args):
         if self.enabled:
             self.events.append({
                 "name": name, "ts": int(timestamp * 1000000), 
-                "ph": phase, "pid": 0, "tid": 0, "args": args
+                "ph": phase, "pid": gpu_id, "tid": 0, "args": args
             })
     
     def save(self, filename: str):
@@ -135,12 +135,13 @@ class MetricsCollector:
 
 
 class GpuExecutor:
-    def _setup_scheduler(self, env, gpu_resource, config, metrics, tracer, name):
+    def _setup_scheduler(self, env, gpu_resource, config, metrics, tracer, name, gpu_id):
         """Initialize common scheduler components."""
         self.env = env
         self.gpu_resource = gpu_resource
         self.config = config
         self.metrics = metrics
+        self.gpu_id = gpu_id
         self.logger = logging.getLogger(name)
         self.tracer = tracer
         self.queue = deque()
@@ -149,9 +150,9 @@ class GpuExecutor:
     def _gpu_execute(self, name: str, duration: float, **trace_args):
         with self.gpu_resource.request() as gpu_req:
             yield gpu_req
-            self.tracer.event(name, self.env.now, phase="B", **trace_args)
+            self.tracer.event(name, self.env.now, phase="B", gpu_id=self.gpu_id, **trace_args)
             yield self.env.timeout(duration)
-            self.tracer.event(name, self.env.now, phase="E")
+            self.tracer.event(name, self.env.now, phase="E", gpu_id=self.gpu_id)
 
     def _idle_wait(self):
         yield self.env.timeout(self.config.scheduler_timeout)
@@ -166,15 +167,16 @@ class PrefillScheduler(GpuExecutor):
         decode_scheduler: "DecodeScheduler",
         metrics: MetricsCollector,
         tracer: SimpleTracer,
+        gpu_id: int,
     ) -> None:
-        self._setup_scheduler(env, gpu_resource, config, metrics, tracer, "Prefill")
+        self._setup_scheduler(env, gpu_resource, config, metrics, tracer, "Prefill", gpu_id)
         self.decode_scheduler = decode_scheduler
 
     def add_request(self, request: Request) -> None:
         """Add request for prefill processing."""
         self.queue.append(request)
         self.metrics.increment(MetricKeys.PREFILL_SUBMITTED)
-        self.logger.debug(f"Queued {request} at {self.env.now:.2f}")
+        self.logger.debug(f"GPU{self.gpu_id}: Queued {request} at {self.env.now:.2f}")
 
     def _run(self) -> Generator[simpy.Event, None, None]:
         """Process prefill requests in batches up to chunk budget."""
@@ -188,7 +190,7 @@ class PrefillScheduler(GpuExecutor):
                 yield from self._idle_wait()
                 continue
 
-            yield from self._execute(batch, total_tokens)
+            yield from self._execute_prefill_step(batch, total_tokens)
             self._finish(batch)
 
     def _collect_batch(self) -> Tuple[List[_BatchItem], int]:
@@ -201,7 +203,7 @@ class PrefillScheduler(GpuExecutor):
             used += tokens
         return batch, used
 
-    def _execute(
+    def _execute_prefill_step(
         self,
         batch: List[_BatchItem],
         total_tokens: int,
@@ -209,7 +211,7 @@ class PrefillScheduler(GpuExecutor):
         """Execute the prefill batch."""
         delay = self.config.prefill_time(total_tokens)
         self.logger.info(
-            f"[{self.env.now:.2f}] Prefill {total_tokens} tokens "
+            f"GPU{self.gpu_id} [{self.env.now:.2f}] Prefill {total_tokens} tokens "
             f"from {len(batch)} requests ({delay:.2f}s)"
         )
         yield from self._gpu_execute("Prefill Batch", delay, tokens=total_tokens, requests=len(batch))
@@ -222,7 +224,7 @@ class PrefillScheduler(GpuExecutor):
                 self.queue.append(item.req)
             else:
                 self.metrics.increment(MetricKeys.PREFILL_COMPLETED)
-                self.logger.info(f"[{self.env.now:.2f}] Prefill complete {item.req}")
+                self.logger.info(f"GPU{self.gpu_id} [{self.env.now:.2f}] Prefill complete {item.req}")
                 self.decode_scheduler.add_request(item.req)
 
 
@@ -234,14 +236,15 @@ class DecodeScheduler(GpuExecutor):
         config: SimulationConfig,
         metrics: MetricsCollector,
         tracer: SimpleTracer,
+        gpu_id: int,
     ) -> None:
-        self._setup_scheduler(env, gpu_resource, config, metrics, tracer, "Decode")
+        self._setup_scheduler(env, gpu_resource, config, metrics, tracer, "Decode", gpu_id)
         self.running: list[Request] = []
 
     def add_request(self, request: Request) -> None:
         self.queue.append(request)
         self.metrics.increment(MetricKeys.DECODE_SUBMITTED)
-        self.logger.debug(f"Queued {request} at {self.env.now:.2f}")
+        self.logger.debug(f"GPU{self.gpu_id}: Queued {request} at {self.env.now:.2f}")
 
     def _run(self) -> Generator[simpy.Event, None, None]:
         """Continuous‑batch decode loop."""
@@ -250,7 +253,7 @@ class DecodeScheduler(GpuExecutor):
                 self.running.append(self.queue.popleft())
 
             if not self.running:
-                self.logger.debug(f"[{self.env.now:.2f}] Decode idle")
+                self.logger.debug(f"GPU{self.gpu_id} [{self.env.now:.2f}] Decode idle")
                 yield from self._idle_wait()
                 continue
             yield from self._execute_decode_step()
@@ -260,7 +263,7 @@ class DecodeScheduler(GpuExecutor):
         """Execute a single decode step for the current batch."""
         step_time = self.config.decode_time(len(self.running))
         self.logger.info(
-            f"[{self.env.now:.2f}] Decode step "
+            f"GPU{self.gpu_id} [{self.env.now:.2f}] Decode step "
             f"batch={self.running} size={len(self.running)}"
         )
         yield from self._gpu_execute("Decode Step", step_time, batch_size=len(self.running))
@@ -277,7 +280,7 @@ class DecodeScheduler(GpuExecutor):
                 self.metrics.increment(MetricKeys.COMPLETED)
                 self.metrics.increment(MetricKeys.TOTAL_LATENCY, latency)
                 self.logger.info(
-                    f"[{self.env.now:.2f}] Finished {req}, "
+                    f"GPU{self.gpu_id} [{self.env.now:.2f}] Finished {req}, "
                     f"latency={latency:.2f}"
                 )
         self.running = still_running
@@ -291,13 +294,12 @@ class RoundRobinScheduler:
         self.tracer = tracer
         self.current_gpu = 0
         
-        # Create GPU resources and schedulers
         self.gpus = [simpy.Resource(env, capacity=1) for _ in range(config.num_gpus)]
         self.decode_schedulers = []
         self.prefill_schedulers = []
-        for i, gpu in enumerate(self.gpus):
-            decoder = DecodeScheduler(env, gpu, config, metrics, tracer)
-            prefill = PrefillScheduler(env, gpu, config, decoder, metrics, tracer)
+        for gpu_id, gpu in enumerate(self.gpus):
+            decoder = DecodeScheduler(env, gpu, config, metrics, tracer, gpu_id)
+            prefill = PrefillScheduler(env, gpu, config, decoder, metrics, tracer, gpu_id)
             self.prefill_schedulers.append(prefill)
             self.decode_schedulers.append(decoder)
     
@@ -306,7 +308,7 @@ class RoundRobinScheduler:
         gpu_id = self.current_gpu
         self.prefill_schedulers[gpu_id].add_request(request)
         self.current_gpu = (self.current_gpu + 1) % self.config.num_gpus
-        logging.getLogger("RoundRobin").debug(f"Assigned {request} to GPU {gpu_id}")
+        logging.getLogger("RoundRobin").info(f"Assigned {request} to GPU{gpu_id}")
 
 
 class Simulation:
@@ -355,7 +357,8 @@ def run_simulation(config: Optional[SimulationConfig] = None) -> Dict[str, float
 if __name__ == "__main__":
     config = SimulationConfig()
     config.enable_tracing = True
-    config.num_gpus = 2  # Test with 2 GPUs
-    config.simulation_time = 10.0  # Shorter simulation for demo
+    config.num_gpus = 8
+    config.arrival_rate = config.arrival_rate * config.num_gpus
+    config.simulation_time = 10.0
     results = run_simulation(config)
     print("Results:", results)
