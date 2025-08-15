@@ -6,6 +6,8 @@ import onnxruntime as ort
 
 
 _prediction_cache = {}
+_PREDICTION_CACHE_SIZE_LIMIT = 1000
+
 
 def load_onnx_model(path):
     session = ort.InferenceSession(path)
@@ -18,17 +20,17 @@ def predict_lgbm_onnx(
     cache_key = (tuple(seq_lens), tuple(cached_context_lens), stage)
     if cache_key in _prediction_cache:
         return _prediction_cache[cache_key]
-    
+
     x = preprocess_input_considering_seq_and_cached_len(
         seq_lens, cached_context_lens, stage
     )[None, :]
     y = model.run(None, {"input": x})[0]
     result = y[0].item()
-    
-    if len(_prediction_cache) >= 1000:
+
+    if len(_prediction_cache) >= _PREDICTION_CACHE_SIZE_LIMIT:
         oldest_key = next(iter(_prediction_cache))
         del _prediction_cache[oldest_key]
-    
+
     _prediction_cache[cache_key] = result
     return result
 
@@ -37,6 +39,10 @@ class ModelExecutorHelper:
     @staticmethod
     def get_onnx_model_prefill_from_folder(folder_name, model_name):
         return Path(folder_name) / model_name / "prefill_model.onnx"
+
+    @staticmethod
+    def get_onnx_model_decode_from_folder(folder_name, model_name):
+        return Path(folder_name) / model_name / "decode_model.onnx"
 
     def __init__(self, onnx_model_prefill, onnx_model_decode) -> None:
         self.prefill_model = load_onnx_model(onnx_model_prefill)
@@ -49,9 +55,8 @@ class ModelExecutorHelper:
             self.prefill_model, seq_lens, cached_context_lens, "prefill"
         )
 
-    def decode(self, seq_lens, cached_context_lens) -> float:
-        if cached_context_lens is None:
-            cached_context_lens = [0] * len(seq_lens)
+    def decode(self, seq_lens) -> float:
+        cached_context_lens = seq_lens
         return predict_lgbm_onnx(
             self.decode_model, seq_lens, cached_context_lens, "decode"
         )
@@ -110,7 +115,7 @@ def preprocess_input_considering_seq_and_cached_len(
     extend_mean = float(np.mean(extend_sorted))
     extend_std = float(np.std(extend_sorted))
     extend_p90 = _percentile_from_sorted(extend_sorted, 90)
-
+    imbalance = (len_max / len_min) if len_min > 1e-10 else np.nan
     imbalance = (len_max / len_min) if len_min > 0 else np.nan
 
     if stage == "prefill":

@@ -4,7 +4,7 @@ import random
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Dict, Generator, List, Optional, Tuple
+from typing import Dict, Generator, List, Tuple
 import simpy
 import time
 from data_loading_script import BaseDataLoader, RandomDataLoader
@@ -28,76 +28,57 @@ class Request:
     arrival_time: float
     input_tokens: int
     output_tokens: int
-    remaining_tokens: int = field(init=False)
+    remaining_output_tokens: int = field(init=False)
     prefill_remaining: int = field(init=False)
+    sequence_length: int = field(init=False)
 
     def __post_init__(self) -> None:
-        self.remaining_tokens = self.output_tokens
+        self.remaining_output_tokens = self.output_tokens
         self.prefill_remaining = self.input_tokens
+        self.sequence_length = 0
 
     def __repr__(self) -> str:
-        return f"Request({self.id}, decode_left={self.remaining_tokens}, prefill_left={self.prefill_remaining})"
+        return f"Request({self.id}, decode_left={self.remaining_output_tokens}, prefill_left={self.prefill_remaining}, seq_len={self.sequence_length})"
 
 
 @dataclass
 class _BatchItem:
     req: Request
-    tokens: int
+    tokens_for_req: int
 
 
 @dataclass
 class SimulationConfig:
     model_execution_helper: ModelExecutorHelper
-    data_loader: Optional[BaseDataLoader] = None
-    seed: int = 42
+    data_loader: BaseDataLoader
     simulation_time: float = 60.0
     max_batch_size: int = 4
-    arrival_rate: float = 0.8
-    min_tokens: int = 2
-    max_tokens: int = 6
-    token_decode_time: float = 0.2
-    token_prefill_time: float = 0.1
     prefill_chunk_size: int = 2
-    scheduler_timeout: float = 0.01
-    max_output_tokens: int = 64
     num_gpus: int = 1
-    inter_arrival_fn: Callable[[float], float] = field(
-        default_factory=lambda: random.expovariate
-    )
     enable_tracing: bool = False
     trace_output_file: str = "simulation_trace.json"
 
     def __post_init__(self) -> None:
-        if self.data_loader is None:
-            self.data_loader = RandomDataLoader(
-                max_requests=1000,
-                min_tokens=self.min_tokens,
-                max_tokens=self.max_tokens,
-                max_output_tokens=self.max_output_tokens,
-                arrival_rate=self.arrival_rate,
-                inter_arrival_fn=self.inter_arrival_fn,
-            )
-        if self.arrival_rate <= 0:
-            raise ValueError("arrival_rate must be positive")
         if self.max_batch_size <= 0:
             raise ValueError("batch_size must be positive")
         if self.simulation_time <= 0:
             raise ValueError("simulation_time must be positive")
-        if self.token_decode_time < 0 or self.token_prefill_time < 0:
-            raise ValueError("Token processing times must be non-negative")
         if self.prefill_chunk_size <= 0:
             raise ValueError("prefill_chunk_size must be positive")
         if self.num_gpus <= 0:
             raise ValueError("num_gpus must be positive")
 
-    # TODO: Add the simulation time
-    def decode_time(self, total_tokens: int) -> float:
+    def decode_time(self, batch: List[_BatchItem]) -> float:
         """Calculate decode time for given number of tokens."""
-        return total_tokens * self.token_decode_time
+        seq_lens = [batch_item.req.sequence_length for batch_item in batch]
+        return self.model_execution_helper.decode(seq_lens)
 
     def prefill_time(self, batch: List[_BatchItem]) -> float:
-        seq_lens = [batch_item.req.prefill_remaining for batch_item in batch]
-        return self.model_execution_helper.prefill(seq_lens, cached_context_lens=None)
+        cached_context_lens = [batch_item.req.sequence_length for batch_item in batch]
+        seq_lens = [batch_item.tokens_for_req for batch_item in batch]
+        return self.model_execution_helper.prefill(
+            seq_lens, cached_context_lens=cached_context_lens
+        )
 
 
 class SimpleTracer:
@@ -173,9 +154,8 @@ class GpuExecutor(ABC):
             yield self.env.timeout(duration)
             self.tracer.event(name, self.env.now, phase="E", gpu_id=self.gpu_id)
 
-
     @abstractmethod
-    def _run(self) -> Generator[Any, None, None]:
+    def _run(self) -> Generator:
         pass
 
 
@@ -207,32 +187,44 @@ class PrefillScheduler(GpuExecutor):
             first_request = yield self.queue.get()
             if isinstance(first_request, Request):
                 batch, total_tokens = yield from self._collect_batch(first_request)
-            
+
                 yield from self._execute_prefill_step(batch, total_tokens)
                 self._finish(batch)
-            
 
-    def _collect_batch(self, first_request: Request) -> Generator[simpy.Event, None, Tuple[List[_BatchItem], int]]:
+    def _collect_batch(
+        self, first_request: Request
+    ) -> Generator[simpy.Event, None, Tuple[List[_BatchItem], int]]:
         batch, used, limit = [], 0, self.config.prefill_chunk_size
-        
+
+        assert first_request.prefill_remaining > 0, (
+            f"Request {first_request.id} has 0 prefill tokens, would cause infinite loop"
+        )
         tokens = min(limit - used, first_request.prefill_remaining)
         batch.append(_BatchItem(first_request, tokens))
         used += tokens
-        
-        # Try to collect more requests without blocking
+
         while used < limit:
             try:
-                additional_req_event = self.queue.get() | self.env.timeout(0)
-                additional_req = yield additional_req_event
-                if isinstance(additional_req, Request):
+                queue_event = self.queue.get()
+                timeout_event = self.env.timeout(0)
+                result = yield (queue_event | timeout_event)
+
+                if result and queue_event in result:
+                    additional_req = result[queue_event]
+                    assert additional_req.prefill_remaining > 0, (
+                        f"Request {additional_req.id} has 0 prefill tokens, would cause infinite loop"
+                    )
                     tokens = min(limit - used, additional_req.prefill_remaining)
                     batch.append(_BatchItem(additional_req, tokens))
                     used += tokens
                 else:
-                    break  # Timeout occurred
-            except:
+                    break
+            except simpy.Interrupt:
                 break
-        
+            except Exception as e:
+                self.logger.error(f"Batching error in prefill: {e}")
+                break
+
         return batch, used
 
     def _execute_prefill_step(
@@ -243,20 +235,23 @@ class PrefillScheduler(GpuExecutor):
         """Execute the prefill batch."""
         delay = self.config.prefill_time(batch)
         self.logger.info(
-            f"GPU{self.gpu_id} [{self.env.now:.2f}] Prefill {sum(item.tokens for item in batch)} tokens "
+            f"GPU{self.gpu_id} [{self.env.now:.2f}] Prefill {total_tokens} tokens "
             f"from {len(batch)} requests ({delay:.2f}s)"
         )
         yield from self._gpu_execute(
             "Prefill Batch",
             delay,
-            tokens=sum(item.tokens for item in batch),
+            tokens=total_tokens,
             requests=len(batch),
         )
 
     def _finish(self, batch: List[_BatchItem]) -> None:
         """Finish processing the batch and handle completions."""
         for item in batch:
-            item.req.prefill_remaining -= item.tokens
+            item.req.prefill_remaining -= item.tokens_for_req
+            item.req.sequence_length += (
+                item.tokens_for_req
+            )
             if item.req.prefill_remaining > 0:
                 self.queue.put(item.req)
             else:
@@ -280,7 +275,7 @@ class DecodeScheduler(GpuExecutor):
         self._setup_scheduler(
             env, gpu_resource, config, metrics, tracer, "Decode", gpu_id
         )
-        self.running: list[Request] = []
+        self.running: List[Request] = []
 
     def add_request(self, request: Request) -> None:
         self.queue.put(request)
@@ -292,26 +287,38 @@ class DecodeScheduler(GpuExecutor):
             if not self.running:
                 first_request = yield self.queue.get()
                 if isinstance(first_request, Request):
+                    assert first_request.remaining_output_tokens > 0, (
+                        f"Request {first_request.id} has 0 decode tokens, should not be in decode scheduler"
+                    )
                     self.running.append(first_request)
-            
-            # Try to collect more requests without blocking
+
             while len(self.running) < self.config.max_batch_size:
                 try:
-                    additional_req_event = self.queue.get() | self.env.timeout(0)
-                    additional_req = yield additional_req_event
-                    if isinstance(additional_req, Request):
+                    queue_event = self.queue.get()
+                    timeout_event = self.env.timeout(0)
+                    result = yield (queue_event | timeout_event)
+
+                    if result and queue_event in result:
+                        additional_req = result[queue_event]
+                        assert additional_req.remaining_output_tokens > 0, (
+                            f"Request {additional_req.id} has 0 decode tokens, should not be in decode scheduler"
+                        )
                         self.running.append(additional_req)
                     else:
-                        break  # Timeout occurred
-                except:
+                        break
+                except simpy.Interrupt:
                     break
-            
+                except Exception as e:
+                    self.logger.error(f"Batching error in decode: {e}")
+                    break
+
             yield from self._execute_decode_step()
             self._finish_decode_step()
 
     def _execute_decode_step(self) -> Generator[simpy.Event, None, None]:
         """Execute a single decode step for the current batch."""
-        step_time = self.config.decode_time(len(self.running))
+        batch_items = [_BatchItem(req, 1) for req in self.running]
+        step_time = self.config.decode_time(batch_items)
         self.logger.info(
             f"GPU{self.gpu_id} [{self.env.now:.2f}] Decode step "
             f"batch={self.running} size={len(self.running)}"
@@ -322,10 +329,13 @@ class DecodeScheduler(GpuExecutor):
 
     def _finish_decode_step(self) -> None:
         """Process decode step results and handle completions."""
-        still_running: list[Request] = []
+        still_running: List[Request] = []
         for req in self.running:
-            req.remaining_tokens -= 1
-            if req.remaining_tokens > 0:
+            req.remaining_output_tokens -= 1
+            req.sequence_length += (
+                1
+            )
+            if req.remaining_output_tokens > 0:
                 still_running.append(req)
             else:
                 latency = self.env.now - req.arrival_time
@@ -374,10 +384,6 @@ class RoundRobinScheduler:
 class Simulation:
     def __init__(self, config: SimulationConfig) -> None:
         self.config = config
-        random.seed(config.seed)
-        logging.basicConfig(
-            level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s"
-        )
         self.env = simpy.Environment()
         self.metrics = MetricsCollector()
         self.tracer = SimpleTracer(config.enable_tracing)
@@ -389,6 +395,9 @@ class Simulation:
         assert data_loader is not None
         self.requests_data = data_loader.get_requests()
         self.inter_arrival_times = data_loader.get_inter_arrival_times()
+        assert len(self.requests_data) == len(self.inter_arrival_times), (
+            f"Length mismatch: requests_data ({len(self.requests_data)}) != inter_arrival_times ({len(self.inter_arrival_times)})"
+        )
 
     def _generate_requests(self) -> Generator[simpy.Event, None, None]:
         req_id = 0
@@ -410,28 +419,37 @@ class Simulation:
         self.tracer.save(self.config.trace_output_file)
         return self.metrics.get_results()
 
+
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s"
+    )
+    folder_name = "profile_output_a100"
+    model_name = "deepseek_ai_DeepSeek_R1_Distill_Qwen_1.5B_TP_1"
     model_execution_helper = ModelExecutorHelper(
-        onnx_model_decode=ModelExecutorHelper.get_onnx_model_prefill_from_folder(
-            "profile_output_a100", "deepseek_ai_DeepSeek_R1_Distill_Qwen_1.5B_TP_1"
+        onnx_model_decode=ModelExecutorHelper.get_onnx_model_decode_from_folder(
+            folder_name, model_name
         ),
         onnx_model_prefill=ModelExecutorHelper.get_onnx_model_prefill_from_folder(
-            "profile_output_a100", "deepseek_ai_DeepSeek_R1_Distill_Qwen_1.5B_TP_1"
+            folder_name, model_name
         ),
     )
-    logging.disable(logging.CRITICAL)
+    # logging.disable(logging.CRITICAL)
+
+    random.seed(42)
     dataloader = RandomDataLoader(
         min_tokens=64,
         max_tokens=128,
         max_output_tokens=128,
-        max_requests=100000, 
-        arrival_rate=50
+        max_requests=1000,
+        arrival_rate=10,
     )
-    config = SimulationConfig(model_execution_helper=model_execution_helper, data_loader=dataloader)
+    config = SimulationConfig(
+        model_execution_helper=model_execution_helper, data_loader=dataloader
+    )
     config.enable_tracing = True
-    config.num_gpus = 1024
-    config.arrival_rate = config.arrival_rate * config.num_gpus
-    config.simulation_time = 1800.0
+    config.num_gpus = 8
+    config.simulation_time = 120.0
     sim = Simulation(config)
     start_time = time.perf_counter()
     results = sim.run()

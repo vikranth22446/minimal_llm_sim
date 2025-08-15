@@ -152,7 +152,9 @@ class RandomDataLoader(BaseDataLoader):
         ]
 
     def get_inter_arrival_times(self) -> List[float]:
-        return [self.inter_arrival_fn(self.arrival_rate) for _ in range(self.max_requests)]
+        return [
+            self.inter_arrival_fn(self.arrival_rate) for _ in range(self.max_requests)
+        ]
 
 
 if __name__ == "__main__":
