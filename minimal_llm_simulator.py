@@ -3,13 +3,14 @@ import logging
 import random
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import Enum, auto
 from typing import Dict, Generator, List, Tuple
 import simpy
 import time
 from data_loading_script import BaseDataLoader, RandomDataLoader
 from model_executor_helper import ModelExecutorHelper
-
+from pprint import pprint
+from heapq import heappop, heappush, heapify
 
 class MetricKeys(Enum):
     PREFILL_SUBMITTED = "prefill_submitted"
@@ -18,7 +19,15 @@ class MetricKeys(Enum):
     COMPLETED = "completed"
     TOTAL_LATENCY = "total_latency"
     AVERAGE_LATENCY = "average_latency"
+    TOTAL_TTFT = "total_ttft"
+    AVERAGE_TTFT = "average_ttft"
+    TOTAL_TPOT = "total_tpot"
+    AVERAGE_TPOT = "average_tpot"
+    MAKESPAN_KEY = "makespan"
 
+class SchedulerPolicy(Enum):
+    ROUND_ROBIN = auto()
+    LJF = auto()
 
 @dataclass
 class Request:
@@ -26,19 +35,27 @@ class Request:
 
     id: int
     arrival_time: float
-    input_tokens: int
-    output_tokens: int
-    remaining_output_tokens: int = field(init=False)
-    prefill_remaining: int = field(init=False)
-    sequence_length: int = field(init=False)
+    target_input_tokens: int
+    target_output_tokens: int
+    prefill_generated: int = field(default=0, init=False)
+    output_generated: int = field(default=0, init=False)
+    first_token_time: float = field(default=0.0, init=False)
+    completion_time: float = field(default=0.0, init=False)
 
-    def __post_init__(self) -> None:
-        self.remaining_output_tokens = self.output_tokens
-        self.prefill_remaining = self.input_tokens
-        self.sequence_length = 0
+    @property
+    def prefill_remaining(self) -> int:
+        return self.target_input_tokens - self.prefill_generated
+    
+    @property
+    def remaining_output_tokens(self) -> int:
+        return self.target_output_tokens - self.output_generated
+    
+    @property
+    def sequence_length(self) -> int:
+        return self.prefill_generated + self.output_generated
 
     def __repr__(self) -> str:
-        return f"Request({self.id}, decode_left={self.remaining_output_tokens}, prefill_left={self.prefill_remaining}, seq_len={self.sequence_length})"
+        return f"Request({self.id}, prefill_gen={self.prefill_generated}, decode_gen={self.output_generated}, seq_len={self.sequence_length}, expected=({self.target_input_tokens}, {self.target_output_tokens}))"
 
 
 @dataclass
@@ -52,11 +69,14 @@ class SimulationConfig:
     model_execution_helper: ModelExecutorHelper
     data_loader: BaseDataLoader
     simulation_time: float = 60.0
-    max_batch_size: int = 4
-    prefill_chunk_size: int = 2
+    max_batch_size: int = 32
+    prefill_chunk_size: int = 8192
     num_gpus: int = 1
     enable_tracing: bool = False
     trace_output_file: str = "simulation_trace.json"
+    decode_log_interval: int = 40
+    batch_mode: bool = False
+    scheduler_policy: SchedulerPolicy = SchedulerPolicy.ROUND_ROBIN
 
     def __post_init__(self) -> None:
         if self.max_batch_size <= 0:
@@ -112,22 +132,38 @@ class MetricsCollector:
 
     def __init__(self) -> None:
         self.metrics: Dict[str, float] = {
-            key.value: 0.0 for key in MetricKeys if key != MetricKeys.AVERAGE_LATENCY
+            key.value: 0.0 for key in MetricKeys if key not in {MetricKeys.AVERAGE_LATENCY, MetricKeys.AVERAGE_TTFT, MetricKeys.AVERAGE_TPOT}
         }
+        self.metrics[MetricKeys.MAKESPAN_KEY.value] = 0.0
 
     def increment(self, key: MetricKeys, value: float = 1.0) -> None:
         """Increment a metric by the given value."""
         self.metrics[key.value] += value
 
     def get_results(self) -> Dict[str, float]:
-        """Calculate and return final metrics including average latency."""
+        """Calculate and return final metrics including averages."""
         completed = self.metrics[MetricKeys.COMPLETED.value]
         avg_latency = (
             self.metrics[MetricKeys.TOTAL_LATENCY.value] / completed
             if completed > 0
             else 0.0
         )
-        return {**self.metrics, MetricKeys.AVERAGE_LATENCY.value: avg_latency}
+        avg_ttft = (
+            self.metrics[MetricKeys.TOTAL_TTFT.value] / completed
+            if completed > 0
+            else 0.0
+        )
+        avg_tpot = (
+            self.metrics[MetricKeys.TOTAL_TPOT.value] / completed
+            if completed > 0
+            else 0.0
+        )
+        return {
+            **self.metrics, 
+            MetricKeys.AVERAGE_LATENCY.value: avg_latency,
+            MetricKeys.AVERAGE_TTFT.value: avg_ttft,
+            MetricKeys.AVERAGE_TPOT.value: avg_tpot
+        }
 
 
 class GpuExecutor(ABC):
@@ -145,8 +181,8 @@ class GpuExecutor(ABC):
         self.queue = simpy.Store(env)
         self.env.process(self._run())
 
-    def _gpu_execute(self, name: str, duration: float, **trace_args):
-        with self.gpu_resource.request() as gpu_req:
+    def _gpu_execute(self, name: str, duration: float, priority: int, **trace_args):
+        with self.gpu_resource.request(priority=priority) as gpu_req:
             yield gpu_req
             self.tracer.event(
                 name, self.env.now, phase="B", gpu_id=self.gpu_id, **trace_args
@@ -174,6 +210,7 @@ class PrefillScheduler(GpuExecutor):
             env, gpu_resource, config, metrics, tracer, "Prefill", gpu_id
         )
         self.decode_scheduler = decode_scheduler
+        self.inflight = False
 
     def add_request(self, request: Request) -> None:
         """Add request for prefill processing."""
@@ -186,10 +223,12 @@ class PrefillScheduler(GpuExecutor):
         while True:
             first_request = yield self.queue.get()
             if isinstance(first_request, Request):
+                self.inflight = True
                 batch, total_tokens = yield from self._collect_batch(first_request)
 
                 yield from self._execute_prefill_step(batch, total_tokens)
                 self._finish(batch)
+                self.inflight = bool(self.queue.items)
 
     def _collect_batch(
         self, first_request: Request
@@ -218,6 +257,7 @@ class PrefillScheduler(GpuExecutor):
                     batch.append(_BatchItem(additional_req, tokens))
                     used += tokens
                 else:
+                    queue_event.cancel() 
                     break
             except simpy.Interrupt:
                 break
@@ -235,12 +275,13 @@ class PrefillScheduler(GpuExecutor):
         """Execute the prefill batch."""
         delay = self.config.prefill_time(batch)
         self.logger.info(
-            f"GPU{self.gpu_id} [{self.env.now:.2f}] Prefill {total_tokens} tokens "
-            f"from {len(batch)} requests ({delay:.2f}s)"
+            f"GPU{self.gpu_id} [{self.env.now:.2f}] Prefill batch. #new-seq: {len(batch)} #new-token: {total_tokens} tokens "
+            f"f({delay:.2f}s)"
         )
         yield from self._gpu_execute(
             "Prefill Batch",
             delay,
+            priority=0,
             tokens=total_tokens,
             requests=len(batch),
         )
@@ -248,15 +289,15 @@ class PrefillScheduler(GpuExecutor):
     def _finish(self, batch: List[_BatchItem]) -> None:
         """Finish processing the batch and handle completions."""
         for item in batch:
-            item.req.prefill_remaining -= item.tokens_for_req
-            item.req.sequence_length += (
-                item.tokens_for_req
-            )
+            item.req.prefill_generated += item.tokens_for_req
             if item.req.prefill_remaining > 0:
                 self.queue.put(item.req)
             else:
+                # After prefill completion, generate the first output token
+                item.req.output_generated += 1
+                item.req.first_token_time = self.env.now
                 self.metrics.increment(MetricKeys.PREFILL_COMPLETED)
-                self.logger.info(
+                self.logger.debug(
                     f"GPU{self.gpu_id} [{self.env.now:.2f}] Prefill complete {item.req}"
                 )
                 self.decode_scheduler.add_request(item.req)
@@ -276,11 +317,22 @@ class DecodeScheduler(GpuExecutor):
             env, gpu_resource, config, metrics, tracer, "Decode", gpu_id
         )
         self.running: List[Request] = []
+        self.prefill_ref = None
+        self.forward_ct_decode = 0
 
     def add_request(self, request: Request) -> None:
         self.queue.put(request)
         self.metrics.increment(MetricKeys.DECODE_SUBMITTED)
         self.logger.debug(f"GPU{self.gpu_id}: Queued {request} at {self.env.now:.2f}")
+
+    def set_prefill_ref(self, prefill: "PrefillScheduler"):
+        self.prefill_ref = prefill
+
+    def _prefill_ready(self) -> bool:
+        return bool(
+            self.prefill_ref
+            and (self.prefill_ref.queue.items or self.prefill_ref.inflight)
+        )
 
     def _run(self) -> Generator[simpy.Event, None, None]:
         while True:
@@ -305,6 +357,7 @@ class DecodeScheduler(GpuExecutor):
                         )
                         self.running.append(additional_req)
                     else:
+                        queue_event.cancel()
                         break
                 except simpy.Interrupt:
                     break
@@ -319,33 +372,46 @@ class DecodeScheduler(GpuExecutor):
         """Execute a single decode step for the current batch."""
         batch_items = [_BatchItem(req, 1) for req in self.running]
         step_time = self.config.decode_time(batch_items)
-        self.logger.info(
-            f"GPU{self.gpu_id} [{self.env.now:.2f}] Decode step "
-            f"batch={self.running} size={len(self.running)}"
-        )
         yield from self._gpu_execute(
-            "Decode Step", step_time, batch_size=len(self.running)
+            "Decode Step",
+            step_time,
+            priority=1,
+            batch_size=len(self.running),
         )
 
     def _finish_decode_step(self) -> None:
         """Process decode step results and handle completions."""
         still_running: List[Request] = []
         for req in self.running:
-            req.remaining_output_tokens -= 1
-            req.sequence_length += (
-                1
-            )
+            req.output_generated += 1
             if req.remaining_output_tokens > 0:
                 still_running.append(req)
             else:
+                req.completion_time = self.env.now
                 latency = self.env.now - req.arrival_time
+                ttft = req.first_token_time - req.arrival_time
+                tpot = (req.completion_time - req.first_token_time) / max(1, req.target_output_tokens - 1)
+                
                 self.metrics.increment(MetricKeys.COMPLETED)
                 self.metrics.increment(MetricKeys.TOTAL_LATENCY, latency)
+                self.metrics.increment(MetricKeys.TOTAL_TTFT, ttft)
+                self.metrics.increment(MetricKeys.TOTAL_TPOT, tpot)
+                self.metrics.metrics[MetricKeys.MAKESPAN_KEY.value] = max(
+                    self.metrics.metrics[MetricKeys.MAKESPAN_KEY.value], req.completion_time
+                )
                 self.logger.info(
                     f"GPU{self.gpu_id} [{self.env.now:.2f}] Finished {req}, "
-                    f"latency={latency:.2f}"
+                    f"latency={latency:.2f}, ttft={ttft:.2f}, tpot={tpot:.2f}"
                 )
         self.running = still_running
+        self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)
+        if self.forward_ct_decode % self.config.decode_log_interval == 0:
+            total_tokens = sum(req.sequence_length for req in self.running)
+            self.logger.info(
+                f"GPU{self.gpu_id} [{self.env.now:.2f}] Decode batch. "
+                f"#running-req: {len(self.running)}, "
+                f"#token: {total_tokens}"
+            )
 
 
 class RoundRobinScheduler:
@@ -362,7 +428,7 @@ class RoundRobinScheduler:
         self.tracer = tracer
         self.current_gpu = 0
 
-        self.gpus = [simpy.Resource(env, capacity=1) for _ in range(config.num_gpus)]
+        self.gpus = [simpy.PriorityResource(env, capacity=1) for _ in range(config.num_gpus)]
         self.decode_schedulers = []
         self.prefill_schedulers = []
         for gpu_id, gpu in enumerate(self.gpus):
@@ -372,14 +438,45 @@ class RoundRobinScheduler:
             )
             self.prefill_schedulers.append(prefill)
             self.decode_schedulers.append(decoder)
+            decoder.set_prefill_ref(prefill)
 
     def add_request(self, request: Request) -> None:
         """Add request to next GPU in round-robin fashion."""
         gpu_id = self.current_gpu
         self.prefill_schedulers[gpu_id].add_request(request)
         self.current_gpu = (self.current_gpu + 1) % self.config.num_gpus
-        logging.getLogger("RoundRobin").info(f"Assigned {request} to GPU{gpu_id}")
+        logging.getLogger("RoundRobin").debug(f"Assigned {request} to GPU{gpu_id} at {self.env.now}")
 
+class LJFRoundRobinScheduler(RoundRobinScheduler):
+    def __init__(self, env, config, metrics, tracer):
+        super().__init__(env, config, metrics, tracer)
+        self._buffer = []
+        assert config.batch_mode, "LJF scheduler requires batch mode to be enabled"
+
+    @staticmethod
+    def _job_size(req: Request) -> int:
+        return req.target_input_tokens + req.target_output_tokens
+
+    def add_request(self, request: Request) -> None:
+        self._buffer.append(request) 
+
+    def flush(self) -> None:
+        self._buffer.sort(key=self._job_size, reverse=True)
+        gpu_loads = [(0.0, i) for i in range(self.config.num_gpus)]
+        requests_per_gpu = {}
+        for req in self._buffer:
+            gpu_load, gpu_id = heappop(gpu_loads)
+            gpu_load += self._job_size(req)
+            heappush(gpu_loads, (gpu_load, gpu_id))
+            requests_per_gpu[gpu_id] = requests_per_gpu.get(gpu_id, []) + [req]
+        
+        for gpu_id in requests_per_gpu.keys():
+             requests_per_gpu[gpu_id].sort(key=self._job_size, reverse=True)
+
+        for gpu_id, reqs in requests_per_gpu.items():
+            for req in reqs:
+                self.prefill_schedulers[gpu_id].add_request(req)
+        self._buffer.clear()
 
 class Simulation:
     def __init__(self, config: SimulationConfig) -> None:
@@ -387,9 +484,14 @@ class Simulation:
         self.env = simpy.Environment()
         self.metrics = MetricsCollector()
         self.tracer = SimpleTracer(config.enable_tracing)
-        self.scheduler = RoundRobinScheduler(
-            self.env, config, self.metrics, self.tracer
-        )
+        if config.scheduler_policy == SchedulerPolicy.LJF:
+            self.scheduler = LJFRoundRobinScheduler(
+                self.env, config, self.metrics, self.tracer
+            )
+        else:
+            self.scheduler = RoundRobinScheduler(
+                self.env, config, self.metrics, self.tracer
+            )
         self.env.process(self._generate_requests())
         data_loader = self.config.data_loader
         assert data_loader is not None
@@ -402,16 +504,19 @@ class Simulation:
     def _generate_requests(self) -> Generator[simpy.Event, None, None]:
         req_id = 0
         for request_data, delay in zip(self.requests_data, self.inter_arrival_times):
-            yield self.env.timeout(delay)
+            if not self.config.batch_mode:
+                yield self.env.timeout(delay)
             req_id += 1
             self.scheduler.add_request(
                 Request(
-                    req_id,
-                    self.env.now,
-                    request_data.input_tokens,
-                    request_data.output_tokens,
+                    id=req_id,
+                    arrival_time=self.env.now,
+                    target_input_tokens=request_data.input_tokens,
+                    target_output_tokens=request_data.output_tokens,
                 )
             )
+        if self.config.scheduler_policy == SchedulerPolicy.LJF:
+            self.scheduler.flush()
 
     def run(self) -> Dict[str, float]:
         """Run the simulation and return results."""
@@ -422,10 +527,13 @@ class Simulation:
 
 if __name__ == "__main__":
     logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s"
+        level=logging.INFO, 
+        format="%(asctime)s %(levelname)s: %(message)s",
+        filename="simulation.log",
+        filemode="w"
     )
     folder_name = "profile_output_a100"
-    model_name = "deepseek_ai_DeepSeek_R1_Distill_Qwen_1.5B_TP_1"
+    model_name = "Qwen_Qwen3_8B_TP_1"
     model_execution_helper = ModelExecutorHelper(
         onnx_model_decode=ModelExecutorHelper.get_onnx_model_decode_from_folder(
             folder_name, model_name
@@ -434,25 +542,35 @@ if __name__ == "__main__":
             folder_name, model_name
         ),
     )
-    # logging.disable(logging.CRITICAL)
 
+    # logging.disable(logging.CRITICAL)
     random.seed(42)
     dataloader = RandomDataLoader(
-        min_tokens=64,
-        max_tokens=128,
-        max_output_tokens=128,
-        max_requests=1000,
-        arrival_rate=10,
+        min_tokens=800,
+        max_tokens=2000,
+        min_output_tokens=128,
+        max_output_tokens=16000,
+        max_requests=1024,
+        arrival_rate=20,
     )
     config = SimulationConfig(
-        model_execution_helper=model_execution_helper, data_loader=dataloader
+        model_execution_helper=model_execution_helper, 
+        data_loader=dataloader,
+        prefill_chunk_size=8192,
+        batch_mode=True,
+        scheduler_policy=SchedulerPolicy.ROUND_ROBIN
     )
     config.enable_tracing = True
     config.num_gpus = 8
-    config.simulation_time = 120.0
+    config.simulation_time = 1200.0
     sim = Simulation(config)
+
+    # print(f"Running scheduler policy", config.scheduler_policy.name)
     start_time = time.perf_counter()
     results = sim.run()
     end_time = time.perf_counter()
-    print("Results:", results)
+    rounded_results = {k: round(v, 6) if isinstance(v, float) else v for k, v in results.items()}
+    rounded_results["average_ttft"] *= 1e3
+    rounded_results["average_tpot"] *= 1e3
+    pprint(rounded_results)
     print(f"Simulation took {end_time - start_time:.2f} seconds")

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Callable, Dict, Generator, List, Optional
 
 import pandas as pd
+import numpy as np
 
 
 @dataclass
@@ -131,24 +132,29 @@ class RandomDataLoader(BaseDataLoader):
         max_requests=1000,
         min_tokens: int = 2,
         max_tokens: int = 6,
+        min_output_tokens: int = 2,
         max_output_tokens: int = 64,
         arrival_rate: float = 0.8,
         inter_arrival_fn: Callable[[float], float] = random.expovariate,
     ):
         self.min_tokens = int(min_tokens)
         self.max_tokens = int(max_tokens)
+        self.min_output_tokens = int(min_output_tokens)
         self.max_output_tokens = int(max_output_tokens)
         self.arrival_rate = arrival_rate
         self.inter_arrival_fn = inter_arrival_fn
         self.max_requests = max_requests
 
     def get_requests(self) -> List[RequestData]:
+        zipf_input = np.random.zipf(1.5, self.max_requests)
+        zipf_output = np.random.zipf(1.5, self.max_requests)
+        
         return [
             RequestData(
-                input_tokens=random.randint(self.min_tokens, self.max_tokens),
-                output_tokens=random.randint(self.min_tokens, self.max_output_tokens),
+            input_tokens=max(self.min_tokens, min(self.max_tokens, int(zipf_input[i]))),
+            output_tokens=max(self.min_output_tokens, min(self.max_output_tokens, int(zipf_output[i]))),
             )
-            for _ in range(self.max_requests)
+            for i in range(self.max_requests)
         ]
 
     def get_inter_arrival_times(self) -> List[float]:
